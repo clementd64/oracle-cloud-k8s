@@ -1,0 +1,129 @@
+---
+- hosts: all
+  become: true
+  vars:
+    k3s_version: v1.24.3+k3s1
+
+    k3s_config_control_plane:
+      tls-san: "{{ ansible_host }}"
+      disable: traefik,local-storage,servicelb
+      disable-helm-controller: true
+      write-kubeconfig-mode: "0644"
+      kube-proxy-arg:
+      - proxy-mode=ipvs
+
+    k3s_config_worker:
+      server: "{{ k3s_server_url }}"
+      token: "{{ k3s_node_token }}"
+      kube-proxy-arg:
+      - proxy-mode=ipvs
+
+  tasks:
+    - name: Remove firewall
+      file:
+        path: '{{ item }}'
+        state: absent
+      loop:
+        - /etc/iptables/rules.v4
+        - /etc/iptables/rules.v6
+      register: removed_firewall
+
+    - name: Flush iptables
+      shell: iptables -F && ip6tables -F
+      ignore_errors: yes
+      when: removed_firewall.changed
+
+    - name: Download k3s
+      get_url:
+        url: https://github.com/k3s-io/k3s/releases/download/{{ k3s_version | urlencode }}/k3s{% if ansible_architecture == "aarch64" %}-arm64{% endif %}
+        dest: /usr/local/bin/k3s
+        mode: 0755
+
+    - name: Set kubectl symlink
+      file:
+        dest: /usr/local/bin/kubectl
+        src: /usr/local/bin/k3s
+        state: link
+
+    - name: Create systemd service
+      get_url:
+        url: https://raw.githubusercontent.com/k3s-io/k3s/{{ k3s_version | urlencode }}/k3s.service
+        dest: /etc/systemd/system/k3s.service
+        mode: 0644
+
+    - name: Create config dir
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: 0755
+
+    - name: Start k3s (control plane)
+      when: inventory_hostname in groups['controlplane']
+      block:
+      - name: Set config file (control plane)
+        copy:
+          content: "{{ k3s_config_control_plane | to_nice_yaml }}"
+          dest: /etc/rancher/k3s/config.yaml
+          mode: 0644
+
+      - name: Start k3s (control plane)
+        systemd:
+          name: k3s
+          state: started
+          enabled: yes
+          daemon_reload: yes
+  
+      - name: Wait for node-token
+        wait_for:
+          path: /var/lib/rancher/k3s/server/node-token
+
+      - name: Read node-token from master
+        slurp:
+          src: /var/lib/rancher/k3s/server/node-token
+        register: node_token
+
+      - name: Store Master node-token
+        set_fact:
+          k3s_node_token: "{{ node_token.content | b64decode | regex_replace('\n', '') }}"
+        delegate_to: "{{ item }}"
+        delegate_facts: true
+        loop: "{{ groups['worker'] }}"
+
+    - name: Start k3s (worker)
+      when: inventory_hostname in groups['worker']
+      block:
+      - name: Set systemd service as agent mode
+        lineinfile:
+          path: /etc/systemd/system/k3s.service
+          regexp: '^ExecStart='
+          line: ExecStart=/usr/local/bin/k3s agent
+          state: present
+
+      - name: Set config file (worker)
+        copy:
+          content: "{{ k3s_config_worker | to_nice_yaml }}"
+          dest: /etc/rancher/k3s/config.yaml
+          mode: 0644
+
+      - name: Start k3s (worker)
+        systemd:
+          name: k3s
+          state: started
+          enabled: yes
+          daemon_reload: yes
+    
+    - name: Fetch kube config
+      fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: ../kubeconfig.yaml
+        flat: yes
+      when: inventory_hostname in groups['controlplane']
+
+    - name: Set ip address to kube config
+      replace:
+        path: ../kubeconfig.yaml
+        regexp: 'https://127\.0\.0\.1:6443'
+        replace: 'https://{{ ansible_host }}:6443'
+      when: inventory_hostname in groups['controlplane']
+      delegate_to: localhost
+      become: false
